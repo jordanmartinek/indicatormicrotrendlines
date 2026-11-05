@@ -1,0 +1,235 @@
+//@version=6
+// =============================================================================
+//  Al Brooks Micro Trendlines & Trend Channels
+// -----------------------------------------------------------------------------
+//  Concept (Al Brooks price action):
+//    In a trend, price moves in pushes. You can draw MICRO TRENDLINES connecting
+//    the swing points on the trend side:
+//       - Bull trend : line along the pullback LOWS (higher lows)
+//       - Bear trend : line along the pullback HIGHS (lower highs)
+//    As a trend matures, each successive line tends to get SHALLOWER (flatter).
+//    Each flattening step means the counter-trend pushes are getting weaker and
+//    traders are getting trapped. When a shallow line finally BREAKS, trapped
+//    traders are flushed, which fuels the bigger reversal / strong continuation.
+//
+//  What this indicator does:
+//    1. Detects bull / bear trend context.
+//    2. Draws micro trendlines fit from the last 2-3 confirmed pivots.
+//    3. Draws a parallel TREND CHANNEL line on the opposite extreme.
+//    4. FREEZES (stops + recolors) a line when price closes through it, but keeps
+//       it on the chart so you can see the whole sequence of pushes.
+//    5. Measures the SLOPE of each successive line. When slopes are getting
+//       shallower (flattening) and then a line breaks -> prints a marker and
+//       fires an alert: "look for bigger-move entries".
+// =============================================================================
+
+indicator("Al Brooks Micro Trendlines & Channels", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// ----------------------------- Inputs ---------------------------------------
+grpTrend   = "Trend Detection"
+emaLen     = input.int(20,  "Trend EMA length",            minval = 1,  group = grpTrend)
+swingBars  = input.int(2,   "Pivot strength (bars L/R)",   minval = 1,  maxval = 20, group = grpTrend, tooltip = "Pivot needs this many lower/higher bars on each side to confirm. Smaller = more, 'micro' pivots.")
+useEma     = input.bool(true, "Require EMA slope agreement", group = grpTrend)
+
+grpLine    = "Micro Trendlines"
+pivotsToFit = input.int(2, "Pivots per micro line (2 or 3)", minval = 2, maxval = 3, group = grpLine, tooltip = "Fit each micro trendline through the last 2 or 3 same-side pivots.")
+extendLine  = input.bool(true, "Extend active line forward", group = grpLine)
+breakSrc    = input.string("close", "Break confirmation", options = ["close","wick"], group = grpLine, tooltip = "close = line breaks on a close beyond it. wick = any penetration breaks it.")
+
+grpChan    = "Trend Channel"
+showChannel = input.bool(true, "Show parallel channel line", group = grpChan)
+
+grpFlat    = "Flattening Signal"
+flatSteps   = input.int(2, "Consecutive shallower lines to flag", minval = 1, maxval = 5, group = grpFlat, tooltip = "How many successively flatter micro lines before a break is treated as a bigger-move signal.")
+flatTol     = input.float(0.0, "Flattening tolerance", step = 0.01, group = grpFlat, tooltip = "A line counts as 'shallower' if |slope| < |prev slope| * (1 - tolerance). 0 = strictly flatter.")
+
+grpColor   = "Colors"
+colBull    = input.color(color.new(color.teal,   0),  "Bull micro line",      group = grpColor)
+colBear    = input.color(color.new(color.red,    0),  "Bear micro line",      group = grpColor)
+colBroken  = input.color(color.new(color.gray,   40), "Broken (frozen) line", group = grpColor)
+colChan    = input.color(color.new(color.blue,   50), "Channel line",         group = grpColor)
+colSignal  = input.color(color.new(color.orange, 0),  "Flattening signal",    group = grpColor)
+
+// ----------------------------- Trend context --------------------------------
+ema      = ta.ema(close, emaLen)
+emaUp    = ema > ema[1]
+emaDown  = ema < ema[1]
+
+// Simple structure read: compare recent closes to the EMA for a bias.
+bullBias = (not useEma or emaUp)   and close > ema
+bearBias = (not useEma or emaDown) and close < ema
+
+// ----------------------------- Pivots ----------------------------------------
+// Pivot values are reported `swingBars` bars back once confirmed.
+ph = ta.pivothigh(high, swingBars, swingBars)
+pl = ta.pivotlow(low,   swingBars, swingBars)
+
+// Store confirmed pivots (price + bar_index of the actual pivot bar).
+var array<float> loPrice = array.new_float()
+var array<int>   loBar   = array.new_int()
+var array<float> hiPrice = array.new_float()
+var array<int>   hiBar   = array.new_int()
+
+// Keep only the most recent pivots we could ever need (fit window + a margin).
+maxKeep = 10
+if not na(pl)
+    array.push(loPrice, pl)
+    array.push(loBar,   bar_index - swingBars)
+    if array.size(loPrice) > maxKeep
+        array.shift(loPrice)
+        array.shift(loBar)
+if not na(ph)
+    array.push(hiPrice, ph)
+    array.push(hiBar,   bar_index - swingBars)
+    if array.size(hiPrice) > maxKeep
+        array.shift(hiPrice)
+        array.shift(hiBar)
+
+// ----------------------------- State -----------------------------------------
+var line  activeLine   = na      // currently extending micro trendline
+var line  activeChan   = na      // currently extending channel line
+var int   lineDir      = 0       // 1 = bull line (under lows), -1 = bear line (over highs)
+var float lineSlope    = na      // slope (price per bar) of the active line
+var float lineB        = na      // intercept at x = anchorBar
+var int   anchorBar    = na      // x used as slope reference for the active line
+var float prevAbsSlope = na      // |slope| of the previously broken line (same dir)
+var int   flatCount    = 0       // how many successive lines have been shallower
+var float chanGap      = na      // channel offset for the active line (reset per line)
+
+// Helper: slope from two points
+f_slope(x1, y1, x2, y2) =>
+    (x2 == x1) ? na : (y2 - y1) / (x2 - x1)
+
+// Helper: value of active line at a given bar_index
+f_lineY(bx) =>
+    na(lineSlope) ? na : lineB + lineSlope * (bx - anchorBar)
+
+// ----------------------------- Build / refit micro line ----------------------
+// We (re)anchor a micro line whenever a new same-side pivot confirms and the
+// trend bias matches. Bull -> connect lows; Bear -> connect highs.
+newBullPivot = not na(pl) and bullBias
+newBearPivot = not na(ph) and bearBias
+
+// Fit a line through the OLDEST and NEWEST pivot of the last `pivotsToFit`
+// same-side pivots. Brooks draws the micro line touching the extremes of the
+// push, so the inner pivot (when pivotsToFit == 3) is only a visual reference.
+f_fitFrom(array<float> prices, array<int> bars) =>
+    int   n  = array.size(prices)
+    float sl = na
+    float b  = na
+    int   ax = na
+    if n >= pivotsToFit
+        int   iOld = n - pivotsToFit      // oldest pivot in the window
+        int   iNew = n - 1                // newest pivot in the window
+        float x1 = array.get(bars,   iOld)
+        float y1 = array.get(prices, iOld)
+        float x2 = array.get(bars,   iNew)
+        float y2 = array.get(prices, iNew)
+        sl := f_slope(x1, y1, x2, y2)
+        b  := y2
+        ax := int(x2)
+    [sl, b, ax]
+
+// On a new same-side pivot, freeze any existing line and start a fresh one.
+f_freezeActive() =>
+    if not na(activeLine)
+        line.set_color(activeLine, colBroken)
+        line.set_style(activeLine, line.style_dotted)
+        line.set_extend(activeLine, extend.none)
+    if not na(activeChan)
+        line.set_color(activeChan, colBroken)
+        line.set_extend(activeChan, extend.none)
+
+if newBullPivot
+    [sl, b, ax] = f_fitFrom(loPrice, loBar)
+    if not na(sl)
+        f_freezeActive()
+        anchorBar := ax
+        lineSlope := sl
+        lineB     := b
+        lineDir   := 1
+        chanGap   := na                      // reset channel gap for the fresh line
+        int   px = array.get(loBar,   array.size(loBar)   - pivotsToFit)
+        float py = array.get(loPrice, array.size(loPrice) - pivotsToFit)
+        activeLine := line.new(px, py, ax, b, xloc = xloc.bar_index, color = colBull, width = 2, extend = extendLine ? extend.right : extend.none)
+
+if newBearPivot
+    [sl, b, ax] = f_fitFrom(hiPrice, hiBar)
+    if not na(sl)
+        f_freezeActive()
+        anchorBar := ax
+        lineSlope := sl
+        lineB     := b
+        lineDir   := -1
+        chanGap   := na                      // reset channel gap for the fresh line
+        int   px = array.get(hiBar,   array.size(hiBar)   - pivotsToFit)
+        float py = array.get(hiPrice, array.size(hiPrice) - pivotsToFit)
+        activeLine := line.new(px, py, ax, b, xloc = xloc.bar_index, color = colBear, width = 2, extend = extendLine ? extend.right : extend.none)
+
+// ----------------------------- Channel line ----------------------------------
+// Parallel line at the same slope through the most extreme opposite point since
+// the active line's anchor.
+if showChannel and not na(activeLine) and not na(lineSlope)
+    float proj   = f_lineY(bar_index)
+    // Bull line sits under the lows -> channel tracks the furthest high above it.
+    // Bear line sits over the highs -> channel tracks the furthest low below it.
+    float offset = lineDir == 1 ? (high - proj) : (low - proj)
+    chanGap := na(chanGap) ? offset : (lineDir == 1 ? math.max(chanGap, offset) : math.min(chanGap, offset))
+    float cy1 = lineB + chanGap
+    float cy2 = proj  + chanGap
+    if na(activeChan)
+        activeChan := line.new(anchorBar, cy1, bar_index, cy2, xloc = xloc.bar_index, color = colChan, style = line.style_dashed, extend = extendLine ? extend.right : extend.none)
+    else
+        line.set_xy1(activeChan, anchorBar, cy1)
+        line.set_xy2(activeChan, bar_index, cy2)
+
+// ----------------------------- Extend active line ----------------------------
+if not na(activeLine) and extendLine
+    line.set_xy2(activeLine, bar_index, f_lineY(bar_index))
+
+// ----------------------------- Break detection -------------------------------
+float yNow     = f_lineY(bar_index)
+bool  brokeBull = lineDir == 1  and not na(yNow) and (breakSrc == "close" ? close < yNow : low  < yNow)
+bool  brokeBear = lineDir == -1 and not na(yNow) and (breakSrc == "close" ? close > yNow : high > yNow)
+bool  broke     = brokeBull or brokeBear
+
+// ----------------------------- Flattening logic -------------------------------
+// When a line breaks, compare its |slope| to the previously broken same-side
+// line. If it is shallower, increment the flattening counter. A break that
+// occurs after `flatSteps` successive shallower lines is the bigger-move signal.
+bool signalFired = false
+if broke and not na(activeLine)
+    float absSlope = math.abs(lineSlope)
+    bool shallower = na(prevAbsSlope) ? false : absSlope < prevAbsSlope * (1.0 - flatTol)
+    if shallower
+        flatCount += 1
+    else
+        flatCount := 0
+    prevAbsSlope := absSlope
+
+    // Freeze the broken line (keep it on the chart).
+    line.set_color(activeLine, colBroken)
+    line.set_style(activeLine, line.style_dotted)
+    line.set_extend(activeLine, extend.none)
+    line.set_xy2(activeLine, bar_index, yNow)
+    if not na(activeChan)
+        line.set_color(activeChan, colBroken)
+        line.set_extend(activeChan, extend.none)
+
+    if flatCount >= flatSteps
+        signalFired := true
+        label.new(bar_index, lineDir == 1 ? low : high, text = (lineDir == 1 ? "⚠ Bull line flush" : "⚠ Bear line flush") + "\nlines flattening → look for bigger move", style = lineDir == 1 ? label.style_label_up : label.style_label_down, color = colSignal, textcolor = color.white, size = size.small)
+        flatCount := 0
+
+    // Clear active refs; a new pivot will start the next line.
+    activeLine := na
+    activeChan := na
+    lineSlope  := na
+    lineDir    := 0
+
+// ----------------------------- Plot / alerts ---------------------------------
+plotshape(signalFired, title = "Flattening flush signal", style = shape.triangleup, location = location.belowbar, color = colSignal, size = size.tiny)
+
+alertcondition(brokeBull, title = "Bull micro trendline broken", message = "Bull micro trendline broken")
+alertcondition(brokeBear, title = "Bear micro trendline broken", message = "Bear micro trendline broken")
+alertcondition(signalFired, title = "Flattening flush (bigger-move)", message = "Micro trendlines flattened then broke — look for a bigger move")

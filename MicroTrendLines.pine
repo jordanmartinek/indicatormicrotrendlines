@@ -29,7 +29,7 @@ indicator("Al Brooks Micro Trendlines & Channels", overlay = true, max_lines_cou
 grpTrend   = "Trend Detection"
 emaLen     = input.int(20,  "Trend EMA length",            minval = 1,  group = grpTrend)
 swingBars  = input.int(2,   "Pivot strength (bars L/R)",   minval = 1,  maxval = 20, group = grpTrend, tooltip = "Pivot needs this many lower/higher bars on each side to confirm. Smaller = more, 'micro' pivots.")
-useEma     = input.bool(true, "Require EMA slope agreement", group = grpTrend)
+useEma     = input.bool(false, "Require EMA slope agreement", group = grpTrend, tooltip = "OFF (default): draw lines purely from swing structure (higher-lows / lower-highs). ON: also require the EMA to slope with the push — stricter, but can miss early pushes off a low/high.")
 
 grpLine    = "Micro Trendlines"
 pivotsToFit = input.int(2, "Pivots per micro line (2 or 3)", minval = 2, maxval = 3, group = grpLine, tooltip = "Fit each micro trendline through the last 2 or 3 same-side pivots.")
@@ -55,9 +55,11 @@ ema      = ta.ema(close, emaLen)
 emaUp    = ema > ema[1]
 emaDown  = ema < ema[1]
 
-// Simple structure read: compare recent closes to the EMA for a bias.
-bullBias = (not useEma or emaUp)   and close > ema
-bearBias = (not useEma or emaDown) and close < ema
+// EMA agreement is now OPTIONAL confirmation only. The primary definition of a
+// push is swing structure (ascending lows for bull, descending highs for bear),
+// evaluated below on the pivots themselves — not on the lagging current bar.
+emaOkBull = not useEma or emaUp
+emaOkBear = not useEma or emaDown
 
 // ----------------------------- Pivots ----------------------------------------
 // Pivot values are reported `swingBars` bars back once confirmed.
@@ -105,10 +107,31 @@ f_lineY(bx) =>
     na(lineSlope) ? na : lineB + lineSlope * (bx - anchorBar)
 
 // ----------------------------- Build / refit micro line ----------------------
-// We (re)anchor a micro line whenever a new same-side pivot confirms and the
-// trend bias matches. Bull -> connect lows; Bear -> connect highs.
-newBullPivot = not na(pl) and bullBias
-newBearPivot = not na(ph) and bearBias
+// We (re)anchor a micro line whenever a new same-side pivot confirms AND the
+// last `pivotsToFit` same-side pivots form a push:
+//   Bull  -> the lows are ascending  (each low >= previous low)  -> line under lows
+//   Bear  -> the highs are descending (each high <= previous high) -> line over highs
+// Structure is read on the pivots themselves, so it is not killed by a lagging EMA.
+f_ascending(array<float> a) =>
+    int n = array.size(a)
+    bool ok = n >= pivotsToFit
+    if ok
+        for i = n - pivotsToFit + 1 to n - 1
+            if array.get(a, i) < array.get(a, i - 1)
+                ok := false
+    ok
+
+f_descending(array<float> a) =>
+    int n = array.size(a)
+    bool ok = n >= pivotsToFit
+    if ok
+        for i = n - pivotsToFit + 1 to n - 1
+            if array.get(a, i) > array.get(a, i - 1)
+                ok := false
+    ok
+
+newBullPivot = not na(pl) and emaOkBull and f_ascending(loPrice)
+newBearPivot = not na(ph) and emaOkBear and f_descending(hiPrice)
 
 // Fit a line through the OLDEST and NEWEST pivot of the last `pivotsToFit`
 // same-side pivots. Brooks draws the micro line touching the extremes of the

@@ -21,13 +21,15 @@ strong continuation. This indicator makes that whole sequence visible and alerta
 
 ## What it does
 
-1. **Push detection (structure-first)** — a bull micro line is drawn whenever the last
-   2–3 swing **lows are ascending** (higher lows); a bear micro line when the last 2–3
-   swing **highs are descending** (lower highs). This is read on the pivots themselves, so
-   it catches a push *as it comes off a low/high* instead of waiting for a lagging EMA.
-   The EMA is now an **optional** confirmation filter (off by default).
-2. **Micro trendlines** — each line is fit through the last **2 or 3** confirmed same-side
-   pivots (your choice). A new pivot starts a new line.
+1. **Push detection (consecutive candles)** — a bear micro line starts after the last
+   **2–3 candles** make *lower highs*, and rides those stepping highs; a bull micro line
+   starts after 2–3 candles make *higher lows* and rides those stepping lows. It reads the
+   candles directly, so it draws on a **steady one-way push** (e.g. a grind down off the
+   20 EMA) where no local pivot ever forms — the case the earlier pivot-based version
+   missed. The EMA is an **optional** confirmation filter (off by default).
+2. **Micro trendlines** — the line is anchored at the first candle of the run and
+   re-pivoted onto each new lower high / higher low, so it always touches the extremes of
+   the push and spans the whole move.
 3. **Break handling** — when price closes through (or wicks through) the active line, the
    line **stops extending and is recolored/dotted**, but it stays on the chart so you can
    read the full progression of pushes.
@@ -42,8 +44,10 @@ strong continuation. This indicator makes that whole sequence visible and alerta
 | Group | Input | Meaning |
 |---|---|---|
 | Trend Detection | **Trend EMA length** | EMA used for the optional slope filter. |
-| | **Pivot strength (bars L/R)** | How many lower/higher bars confirm a pivot. **Set to `1` for fast/steep "micro" pushes**; higher = larger swings. |
-| | **Require EMA slope agreement** | **Off by default.** When on, only draw a push if the EMA also slopes with it (stricter; can miss early pushes off a low/high). |
+| | **Require EMA slope agreement** | **Off by default.** When on, only draw bear lines while the EMA slopes down and bull lines while it slopes up. |
+| Micro Trendlines | **Candles to start a line (2 or 3)** | How many consecutive stepping candles begin a line. `2` is the most sensitive. |
+| | **Allow equal highs/lows as a step** | Treat an equal high/low as a valid step (helps in fast pushes). Off = strictly lower-high / higher-low. |
+| | **Min bars a line must survive** | Ignore 1-bar noise: a line must last this many bars before a break counts toward the flattening sequence. |
 | Micro Trendlines | **Pivots per micro line (2 or 3)** | Fit each line through the last 2 or 3 pivots. |
 | | **Extend active line forward** | Project the live line to the right. |
 | | **Break confirmation** | `close` = break on a close beyond the line; `wick` = any penetration. |
@@ -75,12 +79,15 @@ Three `alertcondition`s are exposed in TradingView's **Add alert** dialog:
 
 ## Tuning tips
 
-- **Pivot strength** is the main knob. **If a fast bullish/bearish push isn't getting a
-  line, lower this to `1`** — steep micro pushes are only a few bars long and need a small
-  pivot strength to register a pivot inside them. `3`+ gives larger swings.
-- Leave **Require EMA slope agreement** off if you want lines on every structural push
-  (including the first leg off a low/high). Turn it on only to filter to higher-timeframe-
-  aligned pushes.
+- **Candles to start a line** is the main knob. `2` draws on nearly every push (most
+  sensitive); `3` waits for a cleaner three-candle run and draws fewer, more significant
+  lines.
+- Keep **Allow equal highs/lows** on for fast pushes where a bar matches the prior
+  high/low exactly; turn it off if you want only strictly stepping candles.
+- Leave **Require EMA slope agreement** off to draw lines on every push (including the
+  first leg off a low/high). Turn it on only to filter to EMA-aligned pushes.
+- Raise **Min bars a line must survive** to stop single-bar pokes from counting as breaks
+  in the flattening sequence.
 - Use **`close`** break confirmation to cut noise; **`wick`** to catch breaks earlier.
 - Raise **Consecutive shallower lines to flag** on noisy, lower timeframes.
 

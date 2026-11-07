@@ -1,0 +1,415 @@
+//@version=6
+// =============================================================================
+//  Brooks Microtrendline Engine  —  PHASE 1: CORE ENGINE
+// -----------------------------------------------------------------------------
+//  Scope of this phase (see README for the full roadmap):
+//    * Bullish / bearish microtrendline detection
+//        - PIVOT path   : two adjacent swing lows (higher low) / swing highs
+//                         (lower high), 2-10 bars apart, validated against the
+//                         bars in between ("clean" line).
+//        - CHANNEL path : a separate microchannel detector. Strong channels can
+//                         form in 3-4 bars with no pivots, so it builds a
+//                         support/resistance line from consecutive stepping bars.
+//    * Touch counting, age, slope (ATR/bar) and a heuristic line-quality score
+//    * Break state machine:  ACTIVE -> BREAK? (potential) -> BROKEN (confirmed)
+//                                          \-> reclaimed = FAILED BREAKOUT
+//    * Basic signal-bar quality test
+//    * LONG / SHORT markers on a failed-breakout + good signal bar
+//
+//  NON-REPAINTING DESIGN
+//    All state changes and all drawing happen ONLY on a confirmed (closed) bar
+//    (barstate.isconfirmed). Pivots are used only once ta.pivot* has confirmed
+//    them. Nothing here uses request.security() yet (that arrives in Phase 3).
+//
+//  NOT IN THIS PHASE: H1/H2/L1/L2, market classification, MTF bias, VWAP,
+//  confidence score, entry/stop/target tracking, dashboard, stats.
+//  The small debug table is just for verifying the engine.
+// =============================================================================
+
+indicator("Brooks Microtrendline Engine [Phase 1]", shorttitle = "BME-P1", overlay = true, max_lines_count = 300, max_labels_count = 300, max_bars_back = 200)
+
+// ----------------------------- Inputs ----------------------------------------
+G1 = "1 · Microtrendline detection"
+pivLen       = input.int(2, "Pivot sensitivity (bars each side)", minval = 1, maxval = 5, group = G1, tooltip = "Bars on each side needed to confirm a swing pivot. Lower = more/faster pivots. Pivots confirm this many bars late (that is what keeps them non-repainting).")
+minBarsBtw   = input.int(2, "Min bars between pivots", minval = 1, maxval = 10, group = G1)
+maxBarsBtw   = input.int(10, "Max bars between pivots", minval = 2, maxval = 30, group = G1, tooltip = "Keeps lines 'micro' (roughly 2-10 bars) and stops unrelated swings being connected.")
+minTouches   = input.int(2, "Min touches to qualify for signals", minval = 2, maxval = 6, group = G1, tooltip = "The two anchor points count as 2 touches. Set 3+ to require at least one extra respected touch.")
+maxAge       = input.int(30, "Max trendline age (bars)", minval = 5, maxval = 200, group = G1)
+minSlopeATR  = input.float(0.03, "Min slope (ATR per bar)", minval = 0.0, step = 0.01, group = G1, tooltip = "Rejects flat / poorly defined lines.")
+maxSlopeATR  = input.float(1.0, "Max slope (ATR per bar)", minval = 0.05, step = 0.05, group = G1, tooltip = "Rejects near-vertical lines that are really single spikes.")
+maxPenATR    = input.float(0.10, "Max wick penetration (ATR)", minval = 0.0, step = 0.01, group = G1, tooltip = "A wick poking through the line by more than this counts as a break attempt. Any CLOSE beyond the line is always a break attempt.")
+touchTolATR  = input.float(0.10, "Touch tolerance (ATR)", minval = 0.0, step = 0.01, group = G1, tooltip = "A bar whose near-side extreme is within this distance of the line (and closes on the right side) counts as a touch.")
+
+G2 = "2 · Microchannel detector"
+useChn           = input.bool(true, "Enable microchannel detector", group = G2)
+chnMinBars       = input.int(3, "Min bars in channel", minval = 2, maxval = 10, group = G2, tooltip = "Consecutive bars making higher lows (bull) / lower highs (bear).")
+chnMaxBars       = input.int(10, "Max bars when creating channel line", minval = 3, maxval = 20, group = G2)
+chnMinMoveATR    = input.float(0.8, "Min directional move (ATR)", minval = 0.0, step = 0.1, group = G2, tooltip = "Net move from channel start to the current close.")
+chnMinStrongFrac = input.float(0.6, "Min fraction of trend-direction bars", minval = 0.0, maxval = 1.0, step = 0.05, group = G2)
+chnBypassTouches = input.bool(true, "Channel lines bypass the min-touch requirement", group = G2, tooltip = "Strong microchannels can develop over very few bars, so they are allowed to generate signals with only their 2 anchors.")
+
+G3 = "3 · Break / failed breakout"
+failBars       = input.int(3, "Bars allowed to reclaim the line", minval = 1, maxval = 10, group = G3, tooltip = "After a close beyond the line, price must close back on the right side within this many bars for it to count as a FAILED breakout. Otherwise the break is confirmed.")
+maxBreakATR    = input.float(0.75, "Max break extent (ATR)", minval = 0.1, step = 0.05, group = G3, tooltip = "If price travels this far beyond the line it is treated as a genuine break immediately.")
+sigWait        = input.int(2, "Signal-bar window after failed breakout", minval = 0, maxval = 5, group = G3, tooltip = "The reclaim bar itself, plus this many following bars, may serve as the signal bar.")
+reqCtx         = input.bool(true, "Require trend context (EMA slope)", group = G3, tooltip = "Phase 1 placeholder for trend context: longs need a rising 20 EMA, shorts a falling one. Replaced by real market-condition logic in Phase 2/3.")
+ctxLen         = input.int(3, "EMA slope lookback (bars)", minval = 1, maxval = 20, group = G3)
+
+G4 = "4 · Signal bar quality"
+reqQuality     = input.bool(true, "Require quality signal bar", group = G4)
+minBody        = input.float(0.40, "Min body / range", minval = 0.0, maxval = 1.0, step = 0.05, group = G4)
+minClosePos    = input.float(0.60, "Min close position in range (toward trend)", minval = 0.0, maxval = 1.0, step = 0.05, group = G4, tooltip = "Bull: (close-low)/range. Bear: (high-close)/range.")
+maxOppWick     = input.float(0.35, "Max wick against trend / range", minval = 0.0, maxval = 1.0, step = 0.05, group = G4, tooltip = "Bull: upper wick. Bear: lower wick.")
+minRelSize     = input.float(0.60, "Min bar range vs 10-bar average", minval = 0.0, step = 0.1, group = G4)
+
+G5 = "5 · Display"
+showActive = input.bool(true, "Show active trendlines", group = G5)
+showHist   = input.bool(true, "Show historical (dead) trendlines", group = G5, tooltip = "Broken / replaced lines stay on the chart (dotted grey) so you can read the sequence of pushes.")
+maxHist    = input.int(12, "Max historical lines kept", minval = 1, maxval = 100, group = G5)
+showBrkMk  = input.bool(true, "Show break / failed-breakout markers", group = G5)
+showSigMk  = input.bool(true, "Show LONG / SHORT signal markers", group = G5)
+showDbg    = input.bool(true, "Show engine debug table", group = G5)
+colBull    = input.color(color.new(color.green, 0), "Bullish line", group = G5)
+colBear    = input.color(color.new(color.red, 0), "Bearish line", group = G5)
+colHist    = input.color(color.new(color.gray, 55), "Historical line", group = G5)
+
+// ----------------------------- Types -----------------------------------------
+// One tracked microtrendline per direction (d = 1 bull / -1 bear).
+// state: 0 none | 1 active | 2 break attempt pending | 3 confirmed broken
+type TL
+    int    d
+    string src       = ""
+    int    state     = 0
+    int    x1        = na
+    float  y1        = na
+    int    x2        = na
+    float  y2        = na
+    float  slope     = na
+    int    born      = na
+    int    touches   = 0
+    int    lastTouch = na
+    int    brkBar    = na
+    float  brkExt    = na
+    int    failBar   = na
+    float  failExt   = na
+    int    fails     = 0
+    line   ln        = na
+
+// Running count of consecutive stepping bars (microchannel detector).
+type Run
+    int   len    = 0
+    int   sBar   = na
+    float sPx    = na
+    int   strong = 0
+
+var TL  bullTL  = TL.new(d = 1)
+var TL  bearTL  = TL.new(d = -1)
+var Run bullRun = Run.new()
+var Run bearRun = Run.new()
+var array<line> hist = array.new<line>()
+
+var int   pLoBar = na
+var float pLoPx  = na
+var int   pHiBar = na
+var float pHiPx  = na
+
+// ----------------------------- Series ----------------------------------------
+atrV   = ta.atr(14)
+emaV   = ta.ema(close, 20)
+avgRng = ta.sma(high - low, 10)
+pl     = ta.pivotlow(low, pivLen, pivLen)
+ph     = ta.pivothigh(high, pivLen, pivLen)
+
+// All logic runs only on closed bars with valid ATR  ->  no intrabar repainting.
+live     = barstate.isconfirmed and not na(atrV) and not na(avgRng)
+ctxLong  = not reqCtx or emaV > emaV[ctxLen]
+ctxShort = not reqCtx or emaV < emaV[ctxLen]
+
+// ----------------------------- Helpers ---------------------------------------
+f_val(TL t, int bx) =>
+    t.y2 + t.slope * (bx - t.x2)
+
+// Stop drawing a line (ends at endBar), archive or delete it.
+f_retire(TL t, int endBar) =>
+    if not na(t.ln)
+        line.set_extend(t.ln, extend.none)
+        line.set_xy2(t.ln, endBar, f_val(t, endBar))
+        line.set_style(t.ln, line.style_dotted)
+        line.set_color(t.ln, colHist)
+        line.set_width(t.ln, 1)
+        if showHist
+            array.push(hist, t.ln)
+            while array.size(hist) > maxHist
+                line.delete(array.shift(hist))
+        else
+            line.delete(t.ln)
+        t.ln := na
+
+f_create(TL t, string src, int xa, float ya, int xb, float yb) =>
+    f_retire(t, bar_index)
+    t.src       := src
+    t.state     := 1
+    t.x1        := xa
+    t.y1        := ya
+    t.x2        := xb
+    t.y2        := yb
+    t.slope     := (yb - ya) / (xb - xa)
+    t.born      := bar_index
+    t.touches   := 2
+    t.lastTouch := xb
+    t.brkBar    := na
+    t.brkExt    := na
+    t.failBar   := na
+    t.failExt   := na
+    t.fails     := 0
+    if showActive
+        t.ln := line.new(xa, ya, xb, yb, xloc = xloc.bar_index, extend = extend.right, color = t.d == 1 ? colBull : colBear, width = 2)
+
+// Heuristic line quality 0..1 (touches, slope, age). Refined in Phase 3.
+f_tlq(TL t) =>
+    float q = 0.0
+    if t.state > 0 and not na(t.slope) and atrV > 0
+        float touchS = math.min((t.touches - 1) / 4.0, 1.0)
+        float slopeS = math.min(math.abs(t.slope) / atrV / 0.25, 1.0)
+        float ageS   = math.min((bar_index - t.born) / 10.0, 1.0)
+        q := 0.5 * touchS + 0.3 * slopeS + 0.2 * ageS
+    q
+
+// Signal bar test for direction d on the CURRENT (closed) bar.
+f_sigbar(int d) =>
+    float rng    = high - low
+    bool  dirOk  = d == 1 ? close > open : close < open
+    float bodyR  = rng > 0 ? math.abs(close - open) / rng : 0.0
+    float cpos   = rng > 0 ? (d == 1 ? (close - low) / rng : (high - close) / rng) : 0.0
+    float oppW   = rng > 0 ? (d == 1 ? (high - math.max(open, close)) / rng : (math.min(open, close) - low) / rng) : 1.0
+    float rel    = avgRng > 0 ? rng / avgRng : 0.0
+    bool  ok     = dirOk and bodyR >= minBody and cpos >= minClosePos and oppW <= maxOppWick and rel >= minRelSize
+    float score  = dirOk ? (math.min(bodyR / 0.7, 1.0) + math.min(cpos / 0.9, 1.0) + (1.0 - math.min(oppW / 0.5, 1.0)) + math.min(rel / 1.2, 1.0)) / 4.0 : 0.0
+    [ok, score]
+
+// Microchannel run counter: bull = higher/equal lows, bear = lower/equal highs.
+f_run_update(Run r, int d) =>
+    if live
+        bool step   = d == 1 ? low >= low[1] : high <= high[1]
+        bool strong = d == 1 ? close > open : close < open
+        if step
+            if r.len == 0
+                r.sBar   := bar_index - 1
+                r.sPx    := d == 1 ? low[1] : high[1]
+                r.strong := 0
+            r.len += 1
+            if strong
+                r.strong += 1
+        else
+            r.len    := 0
+            r.strong := 0
+
+// PIVOT path: try to build a line from two adjacent same-side pivots.
+f_try_pivot(TL t, int xa, float pa, int xb, float pb) =>
+    bool created = false
+    int  d  = t.d
+    int  dx = xb - xa
+    if live and dx >= minBarsBtw and dx <= maxBarsBtw
+        float dirSlope = d * (pb - pa) / dx      // >0 when line runs in trend direction
+        if dirSlope >= minSlopeATR * atrV and dirSlope <= maxSlopeATR * atrV
+            float lineSl = (pb - pa) / dx
+            // The line must be "clean": no close beyond it and no deep wick
+            // between the first anchor and now (bounded loop, <= ~35 bars).
+            bool clean = true
+            int  span  = bar_index - xa
+            for k = 0 to span
+                float lv  = pa + lineSl * ((bar_index - k) - xa)
+                float pen = d == 1 ? lv - low[k] : high[k] - lv
+                bool  bey = d == 1 ? close[k] < lv : close[k] > lv
+                if bey or pen > maxPenATR * atrV
+                    clean := false
+                    break
+            if clean
+                bool isTouch = t.state == 1 and math.abs(pb - f_val(t, xb)) <= touchTolATR * atrV
+                // don't replace a line that is mid-break or has a pending
+                // failed-breakout signal window open
+                bool blocked = t.state == 2 or isTouch or (t.state == 1 and not na(t.failBar))
+                if not blocked
+                    f_create(t, "PIV", xa, pa, xb, pb)
+                    created := true
+    created
+
+// CHANNEL path: support/resistance line from the run start to the stepping bar
+// with the SHALLOWEST slope, so every bar of the run lies on the right side.
+f_try_chan(TL t, Run r) =>
+    bool created = false
+    int  d = t.d
+    if live and useChn and r.len + 1 >= chnMinBars and r.len <= chnMaxBars - 1 and (t.state == 0 or t.state == 3)
+        float move = d == 1 ? close - r.sPx : r.sPx - close
+        float frac = r.len > 0 ? float(r.strong) / r.len : 0.0
+        if move >= chnMinMoveATR * atrV and frac >= chnMinStrongFrac
+            float bestS = na
+            int   bestM = 0
+            for m = 1 to r.len
+                float px = d == 1 ? low[r.len - m] : high[r.len - m]
+                float s  = d * (px - r.sPx) / m
+                if na(bestS) or s < bestS
+                    bestS := s
+                    bestM := m
+            if not na(bestS) and bestS >= minSlopeATR * atrV and bestS <= maxSlopeATR * atrV
+                float pb = d == 1 ? low[r.len - bestM] : high[r.len - bestM]
+                f_create(t, "CHN", r.sBar, r.sPx, r.sBar + bestM, pb)
+                created := true
+    created
+
+// Per-bar state machine for one line. Returns event flags for this closed bar.
+f_step(TL t) =>
+    bool  brk       = false   // potential break attempt (first bar)
+    bool  failed    = false   // break attempt reclaimed = FAILED breakout
+    bool  confirmed = false   // genuine break
+    bool  touched   = false
+    bool  sig       = false   // failed breakout + quality signal bar
+    float sigScore  = 0.0
+    if live and (t.state == 1 or t.state == 2)
+        int   d   = t.d
+        float val = f_val(t, bar_index)
+
+        if t.state == 1
+            if bar_index - t.born > maxAge
+                f_retire(t, bar_index)
+                t.state := 0
+            else
+                float pen    = d == 1 ? val - low : high - val
+                bool  beyond = d == 1 ? close < val : close > val
+                if beyond
+                    t.state  := 2
+                    t.brkBar := bar_index
+                    t.brkExt := d == 1 ? low : high
+                    brk := true
+                else if pen > maxPenATR * atrV
+                    // wick poked through but the bar closed back on the right side
+                    brk       := true
+                    failed    := true
+                    t.fails   += 1
+                    t.failBar := bar_index
+                    t.failExt := d == 1 ? low : high
+                else if pen >= -touchTolATR * atrV and bar_index - t.lastTouch >= 2
+                    t.touches   += 1
+                    t.lastTouch := bar_index
+                    touched := true
+
+        if t.state == 2 and bar_index > t.brkBar
+            t.brkExt := d == 1 ? math.min(t.brkExt, low) : math.max(t.brkExt, high)
+            bool  reclaim   = d == 1 ? close > val : close < val
+            float beyondAmt = d == 1 ? val - t.brkExt : t.brkExt - val
+            if reclaim and bar_index - t.brkBar <= failBars
+                t.state   := 1
+                t.fails   += 1
+                t.failBar := bar_index
+                t.failExt := t.brkExt
+                failed := true
+            else if bar_index - t.brkBar >= failBars or beyondAmt > maxBreakATR * atrV
+                confirmed := true
+                f_retire(t, t.brkBar)
+                t.state := 3
+
+        // Signal bar may be the reclaim bar or one of the next `sigWait` bars.
+        if t.state == 1 and not na(t.failBar)
+            if bar_index - t.failBar > sigWait
+                t.failBar := na
+            else
+                [ok, sc] = f_sigbar(d)
+                bool right     = d == 1 ? close > val : close < val
+                bool qualified = t.touches >= minTouches or (t.src == "CHN" and chnBypassTouches)
+                bool ctx       = d == 1 ? ctxLong : ctxShort
+                if right and (ok or not reqQuality) and qualified and ctx
+                    sig       := true
+                    sigScore  := sc
+                    t.failBar := na
+    [brk, failed, confirmed, touched, sig, sigScore]
+
+// ----------------------------- Engine per bar --------------------------------
+// 1) update microchannel run counters
+f_run_update(bullRun, 1)
+f_run_update(bearRun, -1)
+
+// 2) advance existing lines (touches / breaks / failed breakouts / signals)
+[bBrk, bFail, bConf, bTouch, bSig, bSc] = f_step(bullTL)
+[sBrk, sFail, sConf, sTouch, sSig, sSc] = f_step(bearTL)
+
+// 3) detect new lines (pivot path first, then microchannel path)
+bool bullNew = false
+bool bearNew = false
+
+if live and not na(pl)
+    int pb = bar_index - pivLen
+    if not na(pLoBar)
+        bullNew := f_try_pivot(bullTL, pLoBar, pLoPx, pb, pl)
+    pLoBar := pb
+    pLoPx  := pl
+
+if live and not na(ph)
+    int pb = bar_index - pivLen
+    if not na(pHiBar)
+        bearNew := f_try_pivot(bearTL, pHiBar, pHiPx, pb, ph)
+    pHiBar := pb
+    pHiPx  := ph
+
+if not bullNew
+    bullNew := f_try_chan(bullTL, bullRun)
+if not bearNew
+    bearNew := f_try_chan(bearTL, bearRun)
+
+// ----------------------------- Signals / markers -----------------------------
+bool longSig  = bSig
+bool shortSig = sSig
+
+if longSig and showSigMk
+    float entry = high + syminfo.mintick
+    float stop  = math.min(low, nz(bullTL.failExt, low)) - syminfo.mintick
+    label.new(bar_index, low, "LONG", style = label.style_label_up, color = color.new(colBull, 0), textcolor = color.white, size = size.small, tooltip = "Failed bullish microtrendline breakout (" + bullTL.src + ")\nPending stop-entry above: " + str.tostring(entry, format.mintick) + "\nStop below: " + str.tostring(stop, format.mintick) + "\nSignal-bar quality: " + str.tostring(bSc * 100, "#") + "/100")
+
+if shortSig and showSigMk
+    float entry = low - syminfo.mintick
+    float stop  = math.max(high, nz(bearTL.failExt, high)) + syminfo.mintick
+    label.new(bar_index, high, "SHORT", style = label.style_label_down, color = color.new(colBear, 0), textcolor = color.white, size = size.small, tooltip = "Failed bearish microtrendline breakout (" + bearTL.src + ")\nPending stop-entry below: " + str.tostring(entry, format.mintick) + "\nStop above: " + str.tostring(stop, format.mintick) + "\nSignal-bar quality: " + str.tostring(sSc * 100, "#") + "/100")
+
+plotshape(showBrkMk and bBrk and not bFail, "Bull TL break attempt", shape.xcross, location.belowbar, color.yellow, size = size.tiny)
+plotshape(showBrkMk and sBrk and not sFail, "Bear TL break attempt", shape.xcross, location.abovebar, color.yellow, size = size.tiny)
+plotshape(showBrkMk and bConf, "Bull TL confirmed break", shape.diamond, location.belowbar, color.orange, size = size.tiny)
+plotshape(showBrkMk and sConf, "Bear TL confirmed break", shape.diamond, location.abovebar, color.orange, size = size.tiny)
+plotshape(showBrkMk and bFail, "Bull failed breakout", shape.triangleup, location.belowbar, color.aqua, size = size.tiny, text = "FB", textcolor = color.aqua)
+plotshape(showBrkMk and sFail, "Bear failed breakout", shape.triangledown, location.abovebar, color.fuchsia, size = size.tiny, text = "FB", textcolor = color.fuchsia)
+
+// ----------------------------- Debug table -----------------------------------
+f_stTxt(TL t) =>
+    t.state == 1 ? "ACTIVE" : t.state == 2 ? "BREAK?" : t.state == 3 ? "BROKEN" : "-"
+
+var table dbg = table.new(position.top_right, 3, 7, bgcolor = color.new(color.black, 25), frame_color = color.gray, frame_width = 1, border_width = 1)
+if showDbg and barstate.islast
+    table.cell(dbg, 0, 0, "PHASE 1 ENGINE", text_color = color.white, text_size = size.small)
+    table.cell(dbg, 1, 0, "BULL", text_color = colBull, text_size = size.small)
+    table.cell(dbg, 2, 0, "BEAR", text_color = colBear, text_size = size.small)
+    table.cell(dbg, 0, 1, "State", text_color = color.silver, text_size = size.small)
+    table.cell(dbg, 1, 1, f_stTxt(bullTL), text_color = color.white, text_size = size.small)
+    table.cell(dbg, 2, 1, f_stTxt(bearTL), text_color = color.white, text_size = size.small)
+    table.cell(dbg, 0, 2, "Source", text_color = color.silver, text_size = size.small)
+    table.cell(dbg, 1, 2, bullTL.state == 1 or bullTL.state == 2 ? bullTL.src : "-", text_color = color.white, text_size = size.small)
+    table.cell(dbg, 2, 2, bearTL.state == 1 or bearTL.state == 2 ? bearTL.src : "-", text_color = color.white, text_size = size.small)
+    table.cell(dbg, 0, 3, "Touches", text_color = color.silver, text_size = size.small)
+    table.cell(dbg, 1, 3, bullTL.state == 1 or bullTL.state == 2 ? str.tostring(bullTL.touches) : "-", text_color = color.white, text_size = size.small)
+    table.cell(dbg, 2, 3, bearTL.state == 1 or bearTL.state == 2 ? str.tostring(bearTL.touches) : "-", text_color = color.white, text_size = size.small)
+    table.cell(dbg, 0, 4, "Slope ATR/bar", text_color = color.silver, text_size = size.small)
+    table.cell(dbg, 1, 4, bullTL.state == 1 or bullTL.state == 2 ? str.tostring(math.abs(bullTL.slope) / atrV, "#.###") : "-", text_color = color.white, text_size = size.small)
+    table.cell(dbg, 2, 4, bearTL.state == 1 or bearTL.state == 2 ? str.tostring(math.abs(bearTL.slope) / atrV, "#.###") : "-", text_color = color.white, text_size = size.small)
+    table.cell(dbg, 0, 5, "Quality 0-100", text_color = color.silver, text_size = size.small)
+    table.cell(dbg, 1, 5, bullTL.state == 1 or bullTL.state == 2 ? str.tostring(f_tlq(bullTL) * 100, "#") : "-", text_color = color.white, text_size = size.small)
+    table.cell(dbg, 2, 5, bearTL.state == 1 or bearTL.state == 2 ? str.tostring(f_tlq(bearTL) * 100, "#") : "-", text_color = color.white, text_size = size.small)
+    table.cell(dbg, 0, 6, "Failed BOs", text_color = color.silver, text_size = size.small)
+    table.cell(dbg, 1, 6, str.tostring(bullTL.fails), text_color = color.white, text_size = size.small)
+    table.cell(dbg, 2, 6, str.tostring(bearTL.fails), text_color = color.white, text_size = size.small)
+
+// ----------------------------- Alerts (Phase 1 subset) -----------------------
+alertcondition(bullNew, "Bullish microtrendline detected", "{{ticker}} {{interval}}: Bullish microtrendline detected")
+alertcondition(bearNew, "Bearish microtrendline detected", "{{ticker}} {{interval}}: Bearish microtrendline detected")
+alertcondition(bConf, "Bullish microtrendline break (confirmed)", "{{ticker}} {{interval}}: Bullish microtrendline BROKEN")
+alertcondition(sConf, "Bearish microtrendline break (confirmed)", "{{ticker}} {{interval}}: Bearish microtrendline BROKEN")
+alertcondition(bFail, "Bullish failed breakout", "{{ticker}} {{interval}}: Bullish failed microtrendline breakout")
+alertcondition(sFail, "Bearish failed breakout", "{{ticker}} {{interval}}: Bearish failed microtrendline breakout")
+alertcondition(longSig, "LONG signal (failed breakout)", "{{ticker}} {{interval}}: LONG - failed bullish microtrendline breakout, signal bar closed")
+alertcondition(shortSig, "SHORT signal (failed breakout)", "{{ticker}} {{interval}}: SHORT - failed bearish microtrendline breakout, signal bar closed")

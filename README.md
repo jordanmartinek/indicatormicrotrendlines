@@ -1,4 +1,54 @@
-# Al Brooks Micro Trendlines & Trend Channels
+# Brooks Microtrendline Engine (in development)
+
+File: [`BrooksMicrotrendlineEngine.pine`](./BrooksMicrotrendlineEngine.pine) — the
+professional-grade NQ price-action tool, built in phases.
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1 · Core engine | Microtrendline detection (pivot + microchannel), touches/age/slope/quality, break → failed-breakout state machine, signal-bar quality, LONG/SHORT markers | **This branch — needs TradingView compile check** |
+| 2 · Price action intelligence | H1/H2/L1/L2, pullback continuation, failed-breakout reversal, market classification (trend/range/transition) | Next |
+| 3 · Confluence | 15m/5m bias via `request.security` (non-repainting), VWAP, 0–100 confluence score | — |
+| 4 · Trade management | Pending stop entry, stop, 1R/2R/structure targets, triggered/stopped/target/invalidated states | — |
+| 5 · Dashboard & alerts | Full dashboard with score explanation, all 16 alerts | — |
+| 6 · Historical validation | Signal stats, expectancy, segmentation, conservative same-bar stop/target handling | — |
+
+### Phase 1 — how the engine works
+
+- **Two detection paths per direction**
+  - **PIV** — two adjacent confirmed swing lows (bull, higher low) or highs (bear, lower
+    high), 2–10 bars apart, with slope between min/max ATR-per-bar. The line has to be
+    **clean**: no close beyond it and no wick deeper than the penetration tolerance.
+  - **CHN** — a separate **microchannel** detector for strong pushes that never form pivots:
+    N consecutive bars of higher lows / lower highs, mostly trend bars, with a minimum ATR
+    move. Every bar of the run sits on the correct side of the line.
+- **State machine**: `ACTIVE → BREAK?` (a close beyond the line) `→` either **reclaimed
+  within N bars = FAILED BREAKOUT**, or **BROKEN** (no reclaim in time, or price runs too far
+  past the line). A wick through the line that closes back inside is also a failed breakout.
+- **Signal** = failed breakout + quality signal bar (body, close position, opposing wick,
+  relative size) + enough touches (or a CHN line) + EMA-slope context. A signal is a
+  **pending stop entry** one tick beyond the signal bar. Tracking whether it actually
+  triggers comes in Phase 4.
+- **Non-repainting**: every state change and drawing happens only on `barstate.isconfirmed`
+  bars. Pivots are only used after `ta.pivot*` has confirmed them.
+- **Markers**: yellow ✕ = break attempt, orange ◆ = confirmed break, aqua/fuchsia **FB** =
+  failed breakout, green **LONG** / red **SHORT** = signal (hover a label for entry, stop,
+  and signal-bar quality).
+- The small debug table (top-right) shows each line's state, source, touches, slope, quality,
+  and failed-breakout count. The Phase 5 dashboard replaces it.
+
+### Phase 1 test checklist (on TradingView, NQ 1-minute)
+
+1. The script compiles with no errors. Warnings about calling functions inside local scope
+   are expected and harmless.
+2. Steady pushes with no pivots get a **CHN** line. Pivot-based pushes get a **PIV** line.
+3. A close beyond the line followed by a quick reclaim prints **FB**. A strong bull/bear
+   signal bar after it prints **LONG/SHORT**.
+4. A real break prints ◆ and the line turns dotted grey but stays on the chart.
+5. Let the replay bar advance: markers on closed bars must not move or disappear.
+
+---
+
+# (Legacy) Al Brooks Micro Trendlines & Trend Channels
 
 A TradingView **Pine Script v6** indicator that automatically draws Al Brooks–style
 **micro trendlines** and **trend channels** in a bull or bear trend, freezes each line
